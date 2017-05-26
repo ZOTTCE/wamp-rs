@@ -45,7 +45,8 @@ pub struct Connection {
     // sender: Sender,
     // receiver: client::Receiver<stream::WebSocketStream>,
     realm: URI,
-    url: String
+    url: String,
+    timeout: u64,
 }
 
 pub struct Subscription {
@@ -159,20 +160,22 @@ impl Connection {
     pub fn new(url: &str, realm: &str) -> Connection {
         Connection {
             realm: URI::new(realm),
-            url: url.to_string()
+            url: url.to_string(),
+            timeout: 5000,
         }
     }
 
     pub fn connect<'a>(&self) -> WampResult<Client> {
         let (tx, rx) = channel();
         let url = self.url.clone();
+        let timeout = self.timeout;
         let realm = self.realm.clone();
         thread::spawn(move || {
             trace!("Beginning Connection");
             let connect_result = connect(url, |out| {
                 trace!("Got sender");
                 // Set up timeout
-                out.timeout(5000, CONNECTION_TIMEOUT).unwrap();
+                out.timeout(timeout, CONNECTION_TIMEOUT).unwrap();
                 let info = Arc::new(Mutex::new(ConnectionInfo {
                     protocol: String::new(),
                     subscription_requests: HashMap::new(),
@@ -210,6 +213,9 @@ impl Connection {
         })
     }
 
+    pub fn set_timeout(&mut self, timeout: u64) {
+        self.timeout = timeout;
+    }
 }
 
 macro_rules! cancel_future_tuple {
