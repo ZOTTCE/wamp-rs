@@ -42,8 +42,6 @@ macro_rules! try_websocket {
 const CONNECTION_TIMEOUT:Token = Token(124);
 
 pub struct Connection {
-    // sender: Sender,
-    // receiver: client::Receiver<stream::WebSocketStream>,
     realm: URI,
     url: String,
     timeout: u64,
@@ -123,7 +121,7 @@ trait MessageSender {
     fn send_message(&self, message: Message) -> WampResult<()>;
 }
 
-impl MessageSender for ConnectionInfo{
+impl MessageSender for ConnectionInfo {
     fn send_message(&self, message: Message) -> WampResult<()> {
 
         debug!("Sending message {:?} via {}", message, self.protocol);
@@ -547,7 +545,7 @@ impl ConnectionHandler {
         info.session_id = session_id;
         info.connection_state = ConnectionState::Connected;
         drop(info);
-        self.state_transmission.send(Ok(self.connection_info.clone())).unwrap();
+        self.state_transmission.send(Ok(self.connection_info.clone())).unwrap(); // maybe here
     }
 
     fn handle_event(&self, mut info: MutexGuard<ConnectionInfo>, subscription_id: ID, args: Option<List>, kwargs: Option<Dict>) {
@@ -752,6 +750,15 @@ impl Client {
             Ok(future)
         } else {
             Err(Error::new(ErrorKind::InvalidState("Tried to shut down a client that was already shutting down")))
+        }
+    }
+
+    pub fn is_closed(&self) -> bool {
+        let info = self.connection_info.lock().unwrap();
+
+        match info.connection_state {
+            ConnectionState::ShuttingDown | ConnectionState::Disconnected => true,
+            _ => false,
         }
     }
 }
