@@ -382,8 +382,10 @@ impl Handler for ConnectionHandler {
     // TODO: custom timeout
     fn on_frame(&mut self, frame: Frame) -> WSResult<Option<Frame>> {
         let info = self.connection_info.lock().unwrap();
-        // info.sender.timeout(self.timeout, EXPIRE_TIMEOUT);
-        info.sender.timeout(5000, EXPIRE_TIMEOUT)?;
+        
+        if info.connection_state == ConnectionState::Connected {
+            info.sender.timeout(30000, EXPIRE_TIMEOUT)?;
+        }
 
         Ok(Some(frame))
     }
