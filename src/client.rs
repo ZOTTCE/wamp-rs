@@ -5,13 +5,14 @@ use ws::{
     Handler,
     Message as WSMessage,
     Handshake,
+    Frame,
     Result as WSResult,
     Error as WSError,
     ErrorKind as WSErrorKind,
     Request,
 };
 
-use ws::util::Token;
+use ws::util::{Token, Timeout};
 
 use messages::{URI, Dict, List, WelcomeDetails, SubscribeOptions, PublishOptions, CallOptions, InvocationDetails, YieldOptions, ResultDetails, RegisterOptions, Message,  HelloDetails, Reason, ErrorDetails, ClientRoles, MatchingPolicy, ErrorType};
 use std::collections::HashMap;
@@ -40,6 +41,7 @@ macro_rules! try_websocket {
 }
 
 const CONNECTION_TIMEOUT:Token = Token(124);
+const EXPIRE_TIMEOUT: Token = Token(125);
 
 pub struct Connection {
     realm: URI,
@@ -98,7 +100,8 @@ pub struct Client {
 pub struct ConnectionHandler {
     connection_info: Arc<Mutex<ConnectionInfo>>,
     realm: URI,
-    state_transmission: CHSender<ConnectionResult>
+    state_transmission: CHSender<ConnectionResult>,
+    timeout: Option<Timeout>,
 }
 
 struct ConnectionInfo {
@@ -165,15 +168,19 @@ impl Connection {
 
     pub fn connect<'a>(&self) -> WampResult<Client> {
         let (tx, rx) = channel();
+        
         let url = self.url.clone();
         let timeout = self.timeout;
         let realm = self.realm.clone();
+        
         thread::spawn(move || {
             trace!("Beginning Connection");
+            
             let connect_result = connect(url, |out| {
                 trace!("Got sender");
                 // Set up timeout
                 out.timeout(timeout, CONNECTION_TIMEOUT).unwrap();
+
                 let info = Arc::new(Mutex::new(ConnectionInfo {
                     protocol: String::new(),
                     subscription_requests: HashMap::new(),
@@ -189,26 +196,39 @@ impl Connection {
                     shutdown_complete: None,
                     session_id: 0
                 }));
+
                 let handler = ConnectionHandler {
                     state_transmission: tx.clone(),
                     connection_info: info,
-                    realm: realm.clone()
+                    realm: realm.clone(),
+                    timeout: None,
                 };
+
                 handler
             }).map_err(|e| {
                 Error::new(ErrorKind::WSError(e))
             });
+
             debug!("Result of connection: {:?}", connect_result);
+
             match connect_result {
                 Ok(_) => (),
                 Err(e) => {tx.send(Err(e)).unwrap();}
             }
         });
-        let info = try!(rx.recv().unwrap());
-        Ok(Client{
-            connection_info: info,
-            max_session_id: 0
-        })
+
+        // let info = try!(rx.recv().unwrap());
+
+        match rx.recv() {
+            Ok(data) => {
+                let info = try!(data);
+                Ok(Client{
+                    connection_info: info,
+                    max_session_id: 0,
+                })
+            },
+            Err(_) => Err(Error::new(ErrorKind::Timeout)),
+        }
     }
 
     pub fn set_timeout(&mut self, timeout: u64) {
@@ -235,7 +255,9 @@ macro_rules! cancel_future {
 impl Handler for ConnectionHandler {
     fn on_open(&mut self, handshake: Handshake) -> WSResult<()> {
         debug!("Connection Opened");
+        
         let mut info = self.connection_info.lock().unwrap();
+        
         info.protocol = match try!(handshake.response.protocol()) {
             Some(protocol) => {
                 protocol.to_string()
@@ -246,8 +268,11 @@ impl Handler for ConnectionHandler {
         };
 
         let hello_message = Message::Hello(self.realm.clone(), HelloDetails::new(ClientRoles::new()));
+        
         debug!("Sending Hello message");
+        
         thread::sleep(Duration::from_millis(200));
+        
         match info.send_message(hello_message) {
             Ok(_)  => Ok(()),
             Err(e) => {
@@ -262,6 +287,7 @@ impl Handler for ConnectionHandler {
 
     fn on_message(&mut self, message: WSMessage) -> WSResult<()> {
         debug!("Server sent a message: {:?}", message);
+        
         match message {
             WSMessage::Text(message) => {
                 match serde_json::from_str(&message) {
@@ -297,15 +323,20 @@ impl Handler for ConnectionHandler {
 
     fn on_close(&mut self, _code: CloseCode, _reason: &str) {
         debug!("Closing connection");
+        
         let mut info = self.connection_info.lock().unwrap();
+        
         info.sender.close(CloseCode::Normal).ok();
         info.connection_state = ConnectionState::Disconnected;
+        
         cancel_future_tuple!(info.subscription_requests);
         cancel_future_tuple!(info.unsubscription_requests);
         cancel_future_tuple!(info.registration_requests);
         cancel_future_tuple!(info.unregistration_requests);
+        
         cancel_future!(info.publish_requests);
         cancel_future!(info.call_requests);
+        
         info.sender.shutdown().ok();
 
         match info.shutdown_complete.take() {
@@ -316,16 +347,49 @@ impl Handler for ConnectionHandler {
         }
     }
 
-    fn on_timeout(&mut self, token: Token) -> WSResult<()> {
+    fn on_timeout(&mut self, token: Token) -> WSResult<()> {        
         if token == CONNECTION_TIMEOUT {
             let info = self.connection_info.lock().unwrap();
             if info.connection_state == ConnectionState::Connecting {
-                info.sender.shutdown().unwrap();
+                info.sender.shutdown()?;
                 drop(info);
                 self.state_transmission.send(Err(Error::new(ErrorKind::Timeout))).unwrap();
             }
         }
+
+        if token == EXPIRE_TIMEOUT {
+            debug!("connection lost!");
+            let mut info = self.connection_info.lock().unwrap();
+            info.connection_state = ConnectionState::Disconnected;
+            info.sender.close(CloseCode::Away)?;
+        }
+
         Ok(())
+    }
+
+    fn on_new_timeout(&mut self, token: Token, timeout: Timeout) -> WSResult<()> {
+        if token == EXPIRE_TIMEOUT {
+            if let Some(last_timeout) = self.timeout.take() {
+                let info = self.connection_info.lock().unwrap();
+                info.sender.cancel(last_timeout)?;
+            }
+            self.timeout = Some(timeout);
+        }
+
+        Ok(())
+    }
+
+    // TODO: custom timeout
+    fn on_frame(&mut self, frame: Frame) -> WSResult<Option<Frame>> {
+        let info = self.connection_info.lock().unwrap();
+        // info.sender.timeout(self.timeout, EXPIRE_TIMEOUT);
+        info.sender.timeout(5000, EXPIRE_TIMEOUT)?;
+
+        Ok(Some(frame))
+    }
+
+    fn on_error(&mut self, err: WSError) {
+        debug!("WS error: {:#?}", err);
     }
 
     fn build_request(&mut self, url: &Url) -> WSResult<Request> {
@@ -340,10 +404,11 @@ impl Handler for ConnectionHandler {
 
 
 impl ConnectionHandler {
-
     fn handle_message(&mut self, message: Message) -> bool {
         let mut info = self.connection_info.lock().unwrap();
+
         debug!("Processing message from server (state: {:?})", info.connection_state);
+
         match info.connection_state {
             ConnectionState::Connecting => {
                 if let Message::Welcome(session_id, details) = message {
@@ -393,6 +458,7 @@ impl ConnectionHandler {
                 if let Message::Goodbye(_, _) = message {
                     // The router has seen our goodbye message and has responded in kind
                     info!("Router acknolwedged disconnect");
+                    
                     match info.shutdown_complete.take() {
                         Some(promise) => promise.complete(()),
                         None          => {}
@@ -542,10 +608,11 @@ impl ConnectionHandler {
     }
 
     fn handle_welcome(&self, mut info: MutexGuard<ConnectionInfo>, session_id: ID, _details: WelcomeDetails) {
+        // todo cancel timeout
         info.session_id = session_id;
         info.connection_state = ConnectionState::Connected;
         drop(info);
-        self.state_transmission.send(Ok(self.connection_info.clone())).unwrap(); // maybe here
+        self.state_transmission.send(Ok(self.connection_info.clone())).unwrap();
     }
 
     fn handle_event(&self, mut info: MutexGuard<ConnectionInfo>, subscription_id: ID, args: Option<List>, kwargs: Option<Dict>) {
@@ -646,7 +713,6 @@ impl ConnectionHandler {
 }
 
 impl Client {
-
     fn get_next_session_id(&mut self) -> ID {
         self.max_session_id += 1;
         self.max_session_id
@@ -658,9 +724,11 @@ impl Client {
         let (complete, future) = Future::<Subscription, CallError>::pair();
         let callback = SubscriptionCallbackWrapper {callback: callback};
         let mut options = SubscribeOptions::new();
+        
         if policy != MatchingPolicy::Strict {
             options.pattern_match = policy
         }
+        
         let mut info = self.connection_info.lock().unwrap();
         info.subscription_requests.insert(request_id, (complete, callback, topic_pattern.clone()));
         try!(info.send_message(Message::Subscribe(request_id, options, topic_pattern)));

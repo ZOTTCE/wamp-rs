@@ -153,8 +153,7 @@ impl Router {
 
 
 
-impl ConnectionHandler{
-
+impl ConnectionHandler {
     fn remove(&mut self) {
         match self.realm {
             Some(ref realm) => {

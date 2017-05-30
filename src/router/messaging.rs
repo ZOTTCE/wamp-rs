@@ -181,7 +181,6 @@ impl ConnectionHandler {
 }
 
 impl Handler for ConnectionHandler {
-
     fn on_request(&mut self, request: &Request) -> WSResult<Response> {
         info!("New request");
         let mut response = match Response::from_request(request) {
